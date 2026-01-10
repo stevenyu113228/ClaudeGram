@@ -1,0 +1,15 @@
+# Development dependencies
+-r requirements.txt
+
+# Testing
+pytest>=7.0.0
+pytest-asyncio>=0.21.0
+moto>=4.0.0
+
+# Code quality
+black>=23.0.0
+ruff>=0.1.0
+
+# CDK
+aws-cdk-lib>=2.100.0
+constructs>=10.0.0

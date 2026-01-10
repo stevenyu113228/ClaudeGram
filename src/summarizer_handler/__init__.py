@@ -1,0 +1,1 @@
+"""URL summarizer handler module."""
