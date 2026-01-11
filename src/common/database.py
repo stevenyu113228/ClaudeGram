@@ -92,6 +92,12 @@ CREATE TABLE IF NOT EXISTS app_logs (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Processed updates for idempotency (prevent duplicate processing)
+CREATE TABLE IF NOT EXISTS processed_updates (
+    update_id INTEGER PRIMARY KEY,
+    processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_chat ON conversations(telegram_chat_id);
@@ -649,3 +655,36 @@ class AdminSessionRepository:
                 (ip_address, f"-{minutes}"),
             )
             return cursor.fetchone()[0]
+
+
+class ProcessedUpdateRepository:
+    """Repository for tracking processed Telegram updates (idempotency)."""
+
+    def __init__(self, db: S3SQLiteManager):
+        self.db = db
+
+    def is_processed(self, update_id: int) -> bool:
+        """Check if an update has already been processed."""
+        with self.db.connection(upload_on_close=False, readonly=True) as conn:
+            cursor = conn.execute(
+                "SELECT 1 FROM processed_updates WHERE update_id = ?",
+                (update_id,),
+            )
+            return cursor.fetchone() is not None
+
+    def mark_processed(self, update_id: int) -> None:
+        """Mark an update as processed."""
+        with self.db.connection() as conn:
+            conn.execute(
+                "INSERT OR IGNORE INTO processed_updates (update_id) VALUES (?)",
+                (update_id,),
+            )
+
+    def cleanup_old_updates(self, hours: int = 24) -> int:
+        """Remove old processed update records to prevent table bloat."""
+        with self.db.connection() as conn:
+            cursor = conn.execute(
+                "DELETE FROM processed_updates WHERE processed_at < datetime('now', ? || ' hours')",
+                (f"-{hours}",),
+            )
+            return cursor.rowcount

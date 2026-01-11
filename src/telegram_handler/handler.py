@@ -8,7 +8,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.config import get_config
-from common.database import LogRepository, S3SQLiteManager
+from common.database import LogRepository, ProcessedUpdateRepository, S3SQLiteManager
 
 from .auth import AuthorizationService, verify_webhook_token
 from .claude_agent import ClaudeAgentService
@@ -254,6 +254,16 @@ def lambda_handler(event: dict, context) -> dict:
 
     # Process the message
     db = get_db()
+
+    # Check for duplicate update (idempotency)
+    update_id = update.get("update_id")
+    if update_id:
+        processed_repo = ProcessedUpdateRepository(db)
+        if processed_repo.is_processed(update_id):
+            logger.info(f"Skipping duplicate update_id: {update_id}")
+            return {"statusCode": 200, "body": "Duplicate update, skipping"}
+        # Mark as processed immediately to prevent concurrent duplicate processing
+        processed_repo.mark_processed(update_id)
 
     # Log the request
     try:
