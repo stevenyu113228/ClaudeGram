@@ -1,6 +1,7 @@
 """Content extraction from web pages using Playwright."""
 import hashlib
 import logging
+import time
 from dataclasses import dataclass
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
@@ -53,7 +54,10 @@ def extract_content(url: str, timeout_ms: int = 30000) -> ExtractedContent:
 
         try:
             # Navigate to page
-            page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+
+            # Wait for JavaScript to render content
+            time.sleep(3)
 
             # Get title
             title = page.title() or "未知標題"

@@ -1,0 +1,4 @@
+# Summarizer Lambda dependencies
+playwright==1.48.0
+anthropic>=0.40.0
+boto3>=1.34.0

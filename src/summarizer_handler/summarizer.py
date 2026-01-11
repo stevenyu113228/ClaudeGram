@@ -1,6 +1,7 @@
 """Content summarization using Claude."""
 import logging
 import os
+from typing import Optional
 
 from anthropic import Anthropic
 
@@ -12,9 +13,19 @@ def get_anthropic_client() -> Anthropic:
     api_key = os.environ["ANTHROPIC_API_KEY"]
     base_url = os.environ.get("ANTHROPIC_BASE_URL")
 
-    kwargs = {"api_key": api_key}
-    if base_url:
-        kwargs["base_url"] = base_url
+    # Check if using TrendMicro RDSEC endpoint (uses Bearer auth)
+    if base_url and "rdsec" in base_url:
+        kwargs = {
+            "api_key": "dummy",  # Required but not used
+            "base_url": base_url,
+            "default_headers": {
+                "Authorization": f"Bearer {api_key}",
+            },
+        }
+    else:
+        kwargs = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
 
     return Anthropic(**kwargs)
 
@@ -23,7 +34,7 @@ def summarize_content(
     content: str,
     title: str,
     url: str,
-    model: str | None = None,
+    model: Optional[str] = None,
 ) -> str:
     """
     Summarize content in Traditional Chinese using Claude.

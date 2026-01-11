@@ -7,6 +7,7 @@ from aws_cdk import (
     Size,
     Stack,
     aws_apigateway as apigw,
+    aws_ecr_assets as ecr_assets,
     aws_lambda as lambda_,
     aws_logs as logs,
     aws_s3 as s3,
@@ -71,10 +72,35 @@ class TelegramBotStack(Stack):
         )
 
         # =============================================================
+        # Summarizer Lambda (Docker Container with Playwright)
+        # =============================================================
+        # Project root for Docker build context
+        PROJECT_ROOT = Path(__file__).parent.parent.parent
+
+        summarizer_handler = lambda_.DockerImageFunction(
+            self,
+            "SummarizerHandler",
+            code=lambda_.DockerImageCode.from_image_asset(
+                str(PROJECT_ROOT),
+                file="src/summarizer_handler/Dockerfile",
+                platform=ecr_assets.Platform.LINUX_AMD64,  # ARM Mac 需要指定平台
+            ),
+            architecture=lambda_.Architecture.X86_64,  # Lambda 使用 x86_64
+            timeout=Duration.minutes(5),
+            memory_size=2048,
+            ephemeral_storage_size=Size.mebibytes(2048),
+            environment={
+                "ANTHROPIC_API_KEY": anthropic_api_key,
+                "ANTHROPIC_MODEL": anthropic_model,
+                **({"ANTHROPIC_BASE_URL": anthropic_base_url} if anthropic_base_url else {}),
+            },
+            log_retention=logs.RetentionDays.ONE_MONTH,
+            description="URL summarization with Playwright for JS rendering",
+        )
+
+        # =============================================================
         # Telegram Handler Lambda
         # =============================================================
-        # Note: Using simple HTTP-based URL summarization (no Playwright)
-        # For full JS rendering support, deploy the Docker-based summarizer
         telegram_handler = lambda_.Function(
             self,
             "TelegramHandler",
@@ -96,7 +122,7 @@ class TelegramBotStack(Stack):
                 **common_env,
                 "TELEGRAM_BOT_TOKEN": telegram_bot_token,
                 "WEBHOOK_SECRET": webhook_secret,
-                # No SUMMARIZER_FUNCTION_NAME - will use built-in simple summarizer
+                "SUMMARIZER_FUNCTION_NAME": summarizer_handler.function_name,
             },
             log_retention=logs.RetentionDays.ONE_MONTH,
             description="Main Telegram webhook handler with file support",
@@ -134,6 +160,9 @@ class TelegramBotStack(Stack):
         # =============================================================
         database_bucket.grant_read_write(telegram_handler)
         database_bucket.grant_read_write(admin_handler)
+
+        # Allow TelegramHandler to invoke Summarizer
+        summarizer_handler.grant_invoke(telegram_handler)
 
         # =============================================================
         # API Gateway

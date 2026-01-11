@@ -40,8 +40,8 @@ def lambda_handler(event: dict, context) -> dict:
 
     try:
         # Import here to avoid issues if Playwright not available
-        from extractor import extract_content
-        from summarizer import summarize_content
+        from summarizer_handler.extractor import extract_content
+        from summarizer_handler.summarizer import summarize_content
 
         # Extract content
         logger.info(f"Extracting content from: {url}")

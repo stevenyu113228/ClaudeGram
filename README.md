@@ -10,7 +10,7 @@
 - **對話上下文追蹤**: 透過 Telegram reply chain 維持對話脈絡
 - **檔案分析**: 上傳圖片、PDF、Word、PowerPoint 進行內容分析和摘要
 - **網頁搜尋**: 可搜尋網路獲取最新資訊
-- **網址摘要**: 自動摘要分享的網頁內容（繁體中文）
+- **網址摘要**: 自動摘要分享的網頁內容（繁體中文），支援兩階段智慧抓取
 - **用戶管理**: 只允許特定用戶或群組使用
 - **管理介面**: Web-based 管理面板，可管理用戶、群組和查看日誌
 
@@ -30,13 +30,53 @@
 │   Telegram   │────▶│   API Gateway   │────▶│      Lambda Functions       │
 │   Bot API    │     │  /webhook       │     │  - telegram_handler         │
 └──────────────┘     │  /admin/*       │     │  - admin_handler            │
-                     └─────────────────┘     └─────────────────────────────┘
-┌──────────────┐            │                              │
-│    Admin     │────────────┘                              ▼
-│   Browser    │                             ┌─────────────────────────────┐
-└──────────────┘                             │      S3 (SQLite DB)         │
+                     └─────────────────┘     │  - summarizer_handler       │
+┌──────────────┐            │                └─────────────────────────────┘
+│    Admin     │────────────┘                              │
+│   Browser    │                                           ▼
+└──────────────┘                             ┌─────────────────────────────┐
+                                             │      S3 (SQLite DB)         │
                                              └─────────────────────────────┘
 ```
+
+### 網址摘要兩階段架構
+
+為了優化效能，網址摘要採用智慧兩階段策略：
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    URL Summarization Flow                        │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                    ┌─────────▼─────────┐
+                    │   Check Cache     │
+                    └─────────┬─────────┘
+                              │ miss
+                    ┌─────────▼─────────┐
+                    │  Stage 1: HTTP    │  ← aiohttp (快速)
+                    │  Simple Fetch     │
+                    └─────────┬─────────┘
+                              │
+                    ┌─────────▼─────────┐
+                    │  Stage 2: LLM     │  ← Claude Haiku (輕量)
+                    │  SPA Detection    │
+                    └─────────┬─────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              │                               │
+     ┌────────▼────────┐            ┌────────▼────────┐
+     │    COMPLETE     │            │      SPA        │
+     │  直接摘要返回    │            │ 調用 Playwright │
+     └─────────────────┘            └─────────────────┘
+           ~5-10s                        ~60-90s
+```
+
+| 階段 | 說明 | 耗時 |
+|------|------|------|
+| Stage 1 | 簡單 HTTP 抓取，適用大多數靜態網頁 | 2-3s |
+| Stage 2 | 使用 Claude Haiku 判斷是否為 SPA | 1-2s |
+| 直接摘要 | 內容完整時直接用 Claude 摘要 | 5-10s |
+| Playwright | 需要 JavaScript 渲染時使用瀏覽器 | 60-90s |
 
 ## 技術棧
 
@@ -45,6 +85,7 @@
 - **Database**: SQLite on S3
 - **AI**: Anthropic Claude API
 - **Messaging**: Telegram Bot API
+- **Browser Automation**: Playwright (Docker Lambda)
 
 ## 專案結構
 
@@ -63,8 +104,14 @@ claudegram/
 │   │   ├── handler.py             # Lambda 入口點
 │   │   ├── auth.py                # 用戶認證
 │   │   ├── conversation.py        # 對話管理
-│   │   ├── claude_agent.py        # Claude SDK 整合
+│   │   ├── claude_agent.py        # Claude SDK 整合（含兩階段摘要）
 │   │   └── file_handler.py        # 檔案處理（下載、擷取文字）
+│   ├── summarizer_handler/        # Playwright 摘要 Lambda (Docker)
+│   │   ├── Dockerfile             # Lambda Container 定義
+│   │   ├── handler.py             # Lambda 入口點
+│   │   ├── extractor.py           # Playwright 網頁內容擷取
+│   │   ├── summarizer.py          # Claude 摘要生成
+│   │   └── requirements.txt       # Summarizer 依賴
 │   └── admin_handler/             # 管理介面 Lambda
 │       ├── handler.py             # Lambda 入口點
 │       └── auth.py                # 管理員認證
@@ -77,6 +124,7 @@ claudegram/
 
 - Python 3.11+
 - Node.js 18+ (for AWS CDK)
+- Docker (for Playwright Lambda)
 - AWS CLI (已設定 credentials)
 - AWS CDK CLI (`npm install -g aws-cdk`)
 

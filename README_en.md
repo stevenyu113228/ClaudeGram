@@ -10,7 +10,7 @@ A Telegram chatbot built on AWS Lambda + API Gateway, integrated with Claude AI 
 - **Context Tracking**: Maintains conversation context through Telegram reply chains
 - **File Analysis**: Upload images, PDFs, Word, and PowerPoint files for content analysis and summarization
 - **Web Search**: Search the web for up-to-date information
-- **URL Summarization**: Automatically summarizes shared web pages (Traditional Chinese)
+- **URL Summarization**: Automatically summarizes shared web pages (Traditional Chinese) with two-stage intelligent fetching
 - **User Management**: Restrict bot usage to specific users or groups
 - **Admin Panel**: Web-based management interface for users, groups, and logs
 
@@ -30,13 +30,53 @@ A Telegram chatbot built on AWS Lambda + API Gateway, integrated with Claude AI 
 │   Telegram   │────▶│   API Gateway   │────▶│      Lambda Functions       │
 │   Bot API    │     │  /webhook       │     │  - telegram_handler         │
 └──────────────┘     │  /admin/*       │     │  - admin_handler            │
-                     └─────────────────┘     └─────────────────────────────┘
-┌──────────────┐            │                              │
-│    Admin     │────────────┘                              ▼
-│   Browser    │                             ┌─────────────────────────────┐
-└──────────────┘                             │      S3 (SQLite DB)         │
+                     └─────────────────┘     │  - summarizer_handler       │
+┌──────────────┐            │                └─────────────────────────────┘
+│    Admin     │────────────┘                              │
+│   Browser    │                                           ▼
+└──────────────┘                             ┌─────────────────────────────┐
+                                             │      S3 (SQLite DB)         │
                                              └─────────────────────────────┘
 ```
+
+### Two-Stage URL Summarization
+
+For optimized performance, URL summarization uses an intelligent two-stage strategy:
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    URL Summarization Flow                        │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                    ┌─────────▼─────────┐
+                    │   Check Cache     │
+                    └─────────┬─────────┘
+                              │ miss
+                    ┌─────────▼─────────┐
+                    │  Stage 1: HTTP    │  ← aiohttp (fast)
+                    │  Simple Fetch     │
+                    └─────────┬─────────┘
+                              │
+                    ┌─────────▼─────────┐
+                    │  Stage 2: LLM     │  ← Claude Haiku (lightweight)
+                    │  SPA Detection    │
+                    └─────────┬─────────┘
+                              │
+              ┌───────────────┴───────────────┐
+              │                               │
+     ┌────────▼────────┐            ┌────────▼────────┐
+     │    COMPLETE     │            │      SPA        │
+     │ Direct Summary  │            │ Use Playwright  │
+     └─────────────────┘            └─────────────────┘
+           ~5-10s                        ~60-90s
+```
+
+| Stage | Description | Duration |
+|-------|-------------|----------|
+| Stage 1 | Simple HTTP fetch, suitable for most static pages | 2-3s |
+| Stage 2 | Use Claude Haiku to detect if page is SPA | 1-2s |
+| Direct Summary | Summarize with Claude when content is complete | 5-10s |
+| Playwright | Use browser when JavaScript rendering is needed | 60-90s |
 
 ## Tech Stack
 
@@ -45,6 +85,7 @@ A Telegram chatbot built on AWS Lambda + API Gateway, integrated with Claude AI 
 - **Database**: SQLite on S3
 - **AI**: Anthropic Claude API
 - **Messaging**: Telegram Bot API
+- **Browser Automation**: Playwright (Docker Lambda)
 
 ## Project Structure
 
@@ -63,8 +104,14 @@ claudegram/
 │   │   ├── handler.py             # Lambda entry point
 │   │   ├── auth.py                # User authentication
 │   │   ├── conversation.py        # Conversation management
-│   │   ├── claude_agent.py        # Claude SDK integration
+│   │   ├── claude_agent.py        # Claude SDK integration (with two-stage summarization)
 │   │   └── file_handler.py        # File processing (download, text extraction)
+│   ├── summarizer_handler/        # Playwright summarizer Lambda (Docker)
+│   │   ├── Dockerfile             # Lambda Container definition
+│   │   ├── handler.py             # Lambda entry point
+│   │   ├── extractor.py           # Playwright web content extraction
+│   │   ├── summarizer.py          # Claude summary generation
+│   │   └── requirements.txt       # Summarizer dependencies
 │   └── admin_handler/             # Admin panel Lambda
 │       ├── handler.py             # Lambda entry point
 │       └── auth.py                # Admin authentication
@@ -77,6 +124,7 @@ claudegram/
 
 - Python 3.11+
 - Node.js 18+ (for AWS CDK)
+- Docker (for Playwright Lambda)
 - AWS CLI (with configured credentials)
 - AWS CDK CLI (`npm install -g aws-cdk`)
 

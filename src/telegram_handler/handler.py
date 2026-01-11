@@ -245,6 +245,8 @@ async def process_message(
         config=config,
         db=db,
         conversation_id=context.conversation_id,
+        bot_token=config.telegram_bot_token,
+        chat_id=chat_id,
     )
 
     try:
