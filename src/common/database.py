@@ -201,6 +201,10 @@ class S3SQLiteManager:
                 cursor = conn.execute("SELECT * FROM users")
                 rows = cursor.fetchall()
         """
+        # Always download fresh for readonly operations to ensure we have latest data
+        # This is important for authorization checks in warm Lambda instances
+        if readonly:
+            self._downloaded = False
         self._download_if_needed()
 
         conn = sqlite3.connect(self.local_path)
