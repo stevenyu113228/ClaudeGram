@@ -8,10 +8,20 @@
 
 - **智慧對話**: 使用 Claude AI 進行自然語言對話
 - **對話上下文追蹤**: 透過 Telegram reply chain 維持對話脈絡
+- **檔案分析**: 上傳圖片、PDF、Word、PowerPoint 進行內容分析和摘要
 - **網頁搜尋**: 可搜尋網路獲取最新資訊
 - **網址摘要**: 自動摘要分享的網頁內容（繁體中文）
 - **用戶管理**: 只允許特定用戶或群組使用
 - **管理介面**: Web-based 管理面板，可管理用戶、群組和查看日誌
+
+### 支援的檔案類型
+
+| 類型 | 格式 | 處理方式 |
+|------|------|----------|
+| 圖片 | JPG, PNG, GIF, WEBP | Claude Vision (base64) |
+| PDF | .pdf | Claude 原生 PDF 支援 (base64) |
+| Word | .docx | 文字擷取 (python-docx) |
+| PowerPoint | .pptx | 文字擷取 (python-pptx) |
 
 ## 系統架構
 
@@ -53,7 +63,8 @@ claudegram/
 │   │   ├── handler.py             # Lambda 入口點
 │   │   ├── auth.py                # 用戶認證
 │   │   ├── conversation.py        # 對話管理
-│   │   └── claude_agent.py        # Claude SDK 整合
+│   │   ├── claude_agent.py        # Claude SDK 整合
+│   │   └── file_handler.py        # 檔案處理（下載、擷取文字）
 │   └── admin_handler/             # 管理介面 Lambda
 │       ├── handler.py             # Lambda 入口點
 │       └── auth.py                # 管理員認證
@@ -204,6 +215,11 @@ aws s3 cp ./chatbot.db s3://YOUR_BUCKET_NAME/chatbot.db --profile your-profile-n
 2. **繼續對話**: 回覆 Bot 的訊息以維持上下文
 3. **分享網址**: 發送包含 URL 的訊息，Bot 會自動摘要
 4. **追問內容**: 回覆摘要訊息可以針對該網頁內容追問
+5. **上傳檔案**: 傳送圖片、PDF、Word 或 PowerPoint 檔案
+   - 圖片：Bot 會描述圖片內容
+   - PDF/Word/PPT：Bot 會提供文件摘要
+   - 可附加文字說明或問題（使用 caption）
+   - 回覆檔案訊息可針對該檔案追問
 
 ### 管理介面
 
@@ -244,6 +260,13 @@ messages (
 url_summaries (
     id, conversation_id, url, title,
     summary_zh_tw, raw_content, content_hash, created_at
+)
+
+-- 檔案附件
+file_attachments (
+    id, message_id, conversation_id, telegram_file_id,
+    file_type, file_name, mime_type, file_size,
+    base64_data, extracted_text, content_hash, created_at
 )
 
 -- 管理員 session

@@ -8,10 +8,20 @@ A Telegram chatbot built on AWS Lambda + API Gateway, integrated with Claude AI 
 
 - **Intelligent Conversations**: Natural language dialogue powered by Claude AI
 - **Context Tracking**: Maintains conversation context through Telegram reply chains
+- **File Analysis**: Upload images, PDFs, Word, and PowerPoint files for content analysis and summarization
 - **Web Search**: Search the web for up-to-date information
 - **URL Summarization**: Automatically summarizes shared web pages (Traditional Chinese)
 - **User Management**: Restrict bot usage to specific users or groups
 - **Admin Panel**: Web-based management interface for users, groups, and logs
+
+### Supported File Types
+
+| Type | Format | Processing Method |
+|------|--------|-------------------|
+| Image | JPG, PNG, GIF, WEBP | Claude Vision (base64) |
+| PDF | .pdf | Claude native PDF support (base64) |
+| Word | .docx | Text extraction (python-docx) |
+| PowerPoint | .pptx | Text extraction (python-pptx) |
 
 ## Architecture
 
@@ -53,7 +63,8 @@ claudegram/
 │   │   ├── handler.py             # Lambda entry point
 │   │   ├── auth.py                # User authentication
 │   │   ├── conversation.py        # Conversation management
-│   │   └── claude_agent.py        # Claude SDK integration
+│   │   ├── claude_agent.py        # Claude SDK integration
+│   │   └── file_handler.py        # File processing (download, text extraction)
 │   └── admin_handler/             # Admin panel Lambda
 │       ├── handler.py             # Lambda entry point
 │       └── auth.py                # Admin authentication
@@ -204,6 +215,11 @@ aws s3 cp ./chatbot.db s3://YOUR_BUCKET_NAME/chatbot.db --profile your-profile-n
 2. **Continue conversation**: Reply to the bot's message to maintain context
 3. **Share URLs**: Send a message containing a URL, the bot will auto-summarize
 4. **Follow-up questions**: Reply to summary messages to ask about the content
+5. **Upload files**: Send images, PDFs, Word, or PowerPoint files
+   - Images: Bot will describe the image content
+   - PDF/Word/PPT: Bot will provide document summaries
+   - Add captions with text or questions
+   - Reply to file messages to ask follow-up questions about the file
 
 ### Admin Panel
 
@@ -244,6 +260,13 @@ messages (
 url_summaries (
     id, conversation_id, url, title,
     summary_zh_tw, raw_content, content_hash, created_at
+)
+
+-- File attachments
+file_attachments (
+    id, message_id, conversation_id, telegram_file_id,
+    file_type, file_name, mime_type, file_size,
+    base64_data, extracted_text, content_hash, created_at
 )
 
 -- Admin sessions
