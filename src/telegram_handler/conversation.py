@@ -78,9 +78,9 @@ class ConversationService:
         telegram_user_id: int,
         content: str,
         reply_to_message_id: int | None = None,
-    ) -> None:
-        """Add a user message to the conversation."""
-        self.conv_repo.add_message(
+    ) -> dict[str, Any]:
+        """Add a user message to the conversation and return the saved message."""
+        return self.conv_repo.add_message(
             conversation_id=conversation_id,
             telegram_message_id=telegram_message_id,
             telegram_user_id=telegram_user_id,
@@ -131,30 +131,111 @@ class ConversationService:
 def build_claude_messages(
     conversation_history: list[dict[str, Any]],
     current_message: str,
-) -> list[dict[str, str]]:
+    current_file: Any | None = None,
+) -> list[dict]:
     """
-    Build message list for Claude API.
+    Build message list for Claude API, including file attachments.
 
     Args:
         conversation_history: Previous messages in conversation
         current_message: Current user message
+        current_file: Optional ProcessedFile object for current message
 
     Returns:
-        List of messages formatted for Claude API
+        List of messages formatted for Claude API (may include multimodal content)
     """
     messages = []
 
-    # Add conversation history
+    # Add conversation history (text only for now)
     for msg in conversation_history:
         messages.append({
             "role": msg["role"],
             "content": msg["content"],
         })
 
-    # Add current message
-    messages.append({
-        "role": "user",
-        "content": current_message,
-    })
+    # Add current message with optional file
+    if current_file:
+        content_blocks = _build_content_blocks(current_message, current_file)
+        messages.append({
+            "role": "user",
+            "content": content_blocks,
+        })
+    else:
+        messages.append({
+            "role": "user",
+            "content": current_message,
+        })
 
     return messages
+
+
+def _build_content_blocks(text: str, processed_file: Any) -> list[dict]:
+    """
+    Build Claude API content blocks for a message with file.
+
+    Args:
+        text: User's text message
+        processed_file: ProcessedFile object
+
+    Returns:
+        List of content blocks for Claude API
+    """
+    # Import here to avoid circular imports
+    from .file_handler import FileType
+
+    blocks = []
+
+    if processed_file.file_type == FileType.IMAGE:
+        # Image block - Claude Vision
+        blocks.append({
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": processed_file.mime_type,
+                "data": processed_file.base64_data,
+            }
+        })
+
+    elif processed_file.file_type == FileType.PDF:
+        # Document block for PDF - Claude native support
+        blocks.append({
+            "type": "document",
+            "source": {
+                "type": "base64",
+                "media_type": "application/pdf",
+                "data": processed_file.base64_data,
+            },
+        })
+
+    elif processed_file.file_type in (FileType.DOCX, FileType.PPTX):
+        # For extracted text, prepend as context
+        doc_type = "Word 文件" if processed_file.file_type == FileType.DOCX else "PowerPoint 簡報"
+        file_context = (
+            f"[{doc_type}: {processed_file.file_name}]\n\n"
+            f"{processed_file.extracted_text}"
+        )
+        blocks.append({
+            "type": "text",
+            "text": file_context,
+        })
+
+    # Add user's text message
+    if text and text.strip():
+        blocks.append({
+            "type": "text",
+            "text": text,
+        })
+    else:
+        # Default prompt for file without text
+        if processed_file.file_type == FileType.IMAGE:
+            blocks.append({
+                "type": "text",
+                "text": "請描述這張圖片的內容。",
+            })
+        else:
+            blocks.append({
+                "type": "text",
+                "text": "請摘要這個檔案的內容。",
+            })
+
+    return blocks

@@ -8,11 +8,22 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common.config import get_config
-from common.database import LogRepository, ProcessedUpdateRepository, S3SQLiteManager
+from common.database import (
+    FileAttachmentRepository,
+    LogRepository,
+    ProcessedUpdateRepository,
+    S3SQLiteManager,
+)
 
 from .auth import AuthorizationService, verify_webhook_token
 from .claude_agent import ClaudeAgentService
 from .conversation import ConversationService, build_claude_messages
+from .file_handler import (
+    FileType,
+    ProcessedFile,
+    get_supported_formats_message,
+    process_file,
+)
 
 # Configure logging
 logging.basicConfig(
@@ -101,6 +112,7 @@ async def process_message(
     chat = message.get("chat", {})
     user = message.get("from", {})
     text = message.get("text", "")
+    caption = message.get("caption", "")  # File captions
 
     chat_id = chat.get("id")
     chat_type = chat.get("type", "private")
@@ -108,6 +120,31 @@ async def process_message(
     message_id = message.get("message_id")
     reply_to = message.get("reply_to_message", {})
     reply_to_message_id = reply_to.get("message_id") if reply_to else None
+
+    # Detect file attachments
+    file_info = None
+    if message.get("document"):
+        doc = message["document"]
+        file_info = {
+            "file_id": doc["file_id"],
+            "file_name": doc.get("file_name"),
+            "mime_type": doc.get("mime_type"),
+            "file_size": doc.get("file_size", 0),
+        }
+        logger.info(f"Detected document: {file_info['file_name']}")
+    elif message.get("photo"):
+        # Photos come as array of sizes, use largest
+        photo = message["photo"][-1]
+        file_info = {
+            "file_id": photo["file_id"],
+            "file_name": "photo.jpg",
+            "mime_type": "image/jpeg",
+            "file_size": photo.get("file_size", 0),
+        }
+        logger.info("Detected photo")
+
+    # Use caption as text for files, or fall back to text
+    user_text = caption or text
 
     logger.info(
         f"Processing message from user {user_id} in chat {chat_id} ({chat_type})"
@@ -117,21 +154,49 @@ async def process_message(
     auth_service = AuthorizationService(db)
     if not auth_service.is_authorized(user_id, chat_id, chat_type):
         logger.warning(f"Unauthorized access attempt from user {user_id}")
-        # Optionally send a message to unauthorized users
-        # await send_telegram_message(
-        #     config.telegram_bot_token,
-        #     chat_id,
-        #     "抱歉，您沒有權限使用此機器人。",
-        #     message_id,
-        # )
         return {"statusCode": 200, "body": "Unauthorized user"}
 
-    # Skip empty messages
-    if not text.strip():
+    # Skip if no text AND no file
+    if not user_text.strip() and not file_info:
         return {"statusCode": 200, "body": "Empty message"}
 
     # Send typing indicator
     await send_typing_action(config.telegram_bot_token, chat_id)
+
+    # Process file if present
+    processed_file: ProcessedFile | None = None
+    if file_info:
+        try:
+            processed_file = await process_file(
+                bot_token=config.telegram_bot_token,
+                file_id=file_info["file_id"],
+                file_name=file_info["file_name"],
+                mime_type=file_info["mime_type"],
+                file_size=file_info["file_size"],
+            )
+            logger.info(f"File processed: {processed_file.file_type.value}")
+        except ValueError as e:
+            # Unsupported file type or processing error
+            logger.warning(f"File processing failed: {e}")
+            await send_telegram_message(
+                config.telegram_bot_token,
+                chat_id,
+                f"抱歉，無法處理此檔案。{get_supported_formats_message()}",
+                message_id,
+            )
+            return {"statusCode": 200, "body": "Unsupported file type"}
+        except Exception as e:
+            logger.error(f"File processing error: {e}")
+            await send_telegram_message(
+                config.telegram_bot_token,
+                chat_id,
+                "抱歉，處理檔案時發生錯誤。請稍後再試。",
+                message_id,
+            )
+            return {"statusCode": 200, "body": "File processing error"}
+
+    # Determine display content for message storage
+    display_content = user_text.strip() if user_text.strip() else "[檔案已上傳]"
 
     # Get conversation context
     conv_service = ConversationService(db)
@@ -139,22 +204,40 @@ async def process_message(
         telegram_chat_id=chat_id,
         message_id=message_id,
         reply_to_message_id=reply_to_message_id,
-        user_message=text,
+        user_message=display_content,
     )
 
     # Save user message
-    conv_service.add_user_message(
+    saved_message = conv_service.add_user_message(
         conversation_id=context.conversation_id,
         telegram_message_id=message_id,
         telegram_user_id=user_id,
-        content=text,
+        content=display_content,
         reply_to_message_id=reply_to_message_id,
     )
 
-    # Build messages for Claude
+    # Save file attachment if present
+    if processed_file and saved_message:
+        file_repo = FileAttachmentRepository(db)
+        file_repo.save_attachment(
+            message_id=saved_message["id"],
+            conversation_id=context.conversation_id,
+            telegram_file_id=processed_file.telegram_file_id,
+            file_type=processed_file.file_type.value,
+            file_name=processed_file.file_name,
+            mime_type=processed_file.mime_type,
+            file_size=processed_file.file_size,
+            base64_data=processed_file.base64_data,
+            extracted_text=processed_file.extracted_text,
+            content_hash=processed_file.content_hash,
+        )
+        logger.info(f"File attachment saved for message {saved_message['id']}")
+
+    # Build messages for Claude (with file content)
     claude_messages = build_claude_messages(
         conversation_history=context.messages,
-        current_message=text,
+        current_message=user_text,
+        current_file=processed_file,
     )
 
     # Process with Claude Agent

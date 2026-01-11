@@ -98,6 +98,24 @@ CREATE TABLE IF NOT EXISTS processed_updates (
     processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- File attachments for messages (images, PDFs, documents)
+CREATE TABLE IF NOT EXISTS file_attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id INTEGER NOT NULL,
+    conversation_id INTEGER NOT NULL,
+    telegram_file_id TEXT NOT NULL,
+    file_type TEXT NOT NULL CHECK(file_type IN ('image', 'pdf', 'docx', 'pptx')),
+    file_name TEXT,
+    mime_type TEXT,
+    file_size INTEGER,
+    base64_data TEXT,
+    extracted_text TEXT,
+    content_hash TEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (message_id) REFERENCES messages(id),
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id)
+);
+
 -- Indexes for performance
 CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_conversations_chat ON conversations(telegram_chat_id);
@@ -107,6 +125,8 @@ CREATE INDEX IF NOT EXISTS idx_app_logs_created ON app_logs(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_app_logs_level ON app_logs(level, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_admin_sessions_token ON admin_sessions(session_token);
 CREATE INDEX IF NOT EXISTS idx_admin_sessions_expires ON admin_sessions(expires_at);
+CREATE INDEX IF NOT EXISTS idx_file_attachments_message ON file_attachments(message_id);
+CREATE INDEX IF NOT EXISTS idx_file_attachments_conversation ON file_attachments(conversation_id);
 """
 
 
@@ -688,3 +708,77 @@ class ProcessedUpdateRepository:
                 (f"-{hours}",),
             )
             return cursor.rowcount
+
+
+class FileAttachmentRepository:
+    """Repository for file attachment operations."""
+
+    def __init__(self, db: S3SQLiteManager):
+        self.db = db
+
+    def save_attachment(
+        self,
+        message_id: int,
+        conversation_id: int,
+        telegram_file_id: str,
+        file_type: str,
+        file_name: str | None = None,
+        mime_type: str | None = None,
+        file_size: int | None = None,
+        base64_data: str | None = None,
+        extracted_text: str | None = None,
+        content_hash: str | None = None,
+    ) -> dict[str, Any]:
+        """Save a file attachment."""
+        with self.db.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO file_attachments
+                (message_id, conversation_id, telegram_file_id, file_type,
+                 file_name, mime_type, file_size, base64_data, extracted_text, content_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_id,
+                    conversation_id,
+                    telegram_file_id,
+                    file_type,
+                    file_name,
+                    mime_type,
+                    file_size,
+                    base64_data,
+                    extracted_text,
+                    content_hash,
+                ),
+            )
+            attachment_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            cursor = conn.execute(
+                "SELECT * FROM file_attachments WHERE id = ?", (attachment_id,)
+            )
+            return dict(cursor.fetchone())
+
+    def get_attachments_for_message(self, message_id: int) -> list[dict[str, Any]]:
+        """Get all attachments for a message."""
+        with self.db.connection(upload_on_close=False, readonly=True) as conn:
+            cursor = conn.execute(
+                "SELECT * FROM file_attachments WHERE message_id = ?",
+                (message_id,),
+            )
+            return [dict(row) for row in cursor.fetchall()]
+
+    def get_attachments_for_conversation(
+        self, conversation_id: int
+    ) -> list[dict[str, Any]]:
+        """Get all attachments in a conversation."""
+        with self.db.connection(upload_on_close=False, readonly=True) as conn:
+            cursor = conn.execute(
+                """
+                SELECT fa.*, m.telegram_message_id
+                FROM file_attachments fa
+                JOIN messages m ON fa.message_id = m.id
+                WHERE fa.conversation_id = ?
+                ORDER BY fa.created_at ASC
+                """,
+                (conversation_id,),
+            )
+            return [dict(row) for row in cursor.fetchall()]

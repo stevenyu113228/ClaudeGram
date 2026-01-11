@@ -4,6 +4,7 @@ from pathlib import Path
 from aws_cdk import (
     Duration,
     RemovalPolicy,
+    Size,
     Stack,
     aws_apigateway as apigw,
     aws_lambda as lambda_,
@@ -88,8 +89,9 @@ class TelegramBotStack(Stack):
                 ],
             ),
             layers=[deps_layer],
-            timeout=Duration.seconds(90),
-            memory_size=1024,
+            timeout=Duration.seconds(120),
+            memory_size=1536,
+            ephemeral_storage_size=Size.mebibytes(1024),
             environment={
                 **common_env,
                 "TELEGRAM_BOT_TOKEN": telegram_bot_token,
@@ -97,7 +99,7 @@ class TelegramBotStack(Stack):
                 # No SUMMARIZER_FUNCTION_NAME - will use built-in simple summarizer
             },
             log_retention=logs.RetentionDays.ONE_MONTH,
-            description="Main Telegram webhook handler",
+            description="Main Telegram webhook handler with file support",
         )
 
         # =============================================================
