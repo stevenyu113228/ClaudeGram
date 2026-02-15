@@ -1,9 +1,12 @@
 """Claude Agent SDK integration for Telegram bot."""
+import base64
+import hashlib
 import json
 import logging
 import os
 from datetime import datetime, timezone, timedelta
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 import boto3
@@ -11,6 +14,12 @@ from anthropic import Anthropic
 
 from common.database import S3SQLiteManager, URLSummaryRepository
 from telegram_handler.content_extractor import extract_content_from_html
+from telegram_handler.file_handler import (
+    FileType,
+    SUPPORTED_EXTENSIONS,
+    extract_text_from_docx,
+    extract_text_from_pptx,
+)
 
 # Configure logging for this module
 logger = logging.getLogger(__name__)
@@ -45,7 +54,8 @@ def _build_system_prompt() -> str:
 
 可用工具：
 - web_search: 搜尋網頁獲取最新資訊
-- summarize_url: 獲取並摘要網頁內容"""
+- summarize_url: 獲取並摘要網頁內容（用於一般網頁）
+- analyze_file_url: 下載並分析檔案 URL（用於 .pdf, .jpg, .png 等檔案連結）"""
 
 
 class ClaudeAgentService:
@@ -133,8 +143,26 @@ class ClaudeAgentService:
                 },
             },
             {
+                "name": "analyze_file_url",
+                "description": (
+                    "下載並分析檔案 URL（PDF、圖片）。"
+                    "當用戶分享的網址指向檔案（.pdf, .jpg, .jpeg, .png, .gif, .webp, .docx, .pptx）時使用此工具，"
+                    "而非 summarize_url。"
+                ),
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "url": {
+                            "type": "string",
+                            "description": "檔案的 URL",
+                        },
+                    },
+                    "required": ["url"],
+                },
+            },
+            {
                 "name": "summarize_url",
-                "description": "獲取網頁內容並生成繁體中文摘要。當用戶分享網址時使用。",
+                "description": "獲取網頁內容並生成繁體中文摘要。當用戶分享的網址指向網頁（非檔案）時使用。",
                 "input_schema": {
                     "type": "object",
                     "properties": {
@@ -194,6 +222,117 @@ class ClaudeAgentService:
         except Exception as e:
             logger.error(f"Web search failed: {e}")
             return f"搜尋時發生錯誤: {str(e)}"
+
+    async def _execute_analyze_file_url(self, url: str) -> str | list[dict]:
+        """Download a file from URL and return content for Claude analysis.
+
+        Supports: PDF, images (jpg/png/gif/webp), DOCX, PPTX.
+        Returns either a text string or a list of Claude content blocks.
+        """
+        logger.info(f"Analyzing file URL: {url}")
+
+        # Detect file type from URL path
+        parsed = urlparse(url)
+        path = parsed.path.lower().split("?")[0]  # Remove query params
+        ext = os.path.splitext(path)[1]
+
+        if ext not in SUPPORTED_EXTENSIONS:
+            return f"不支援的檔案格式：{ext}。支援的格式：PDF、JPG、PNG、GIF、WEBP、DOCX、PPTX"
+
+        file_type = SUPPORTED_EXTENSIONS[ext]
+
+        # Download file
+        try:
+            connector = aiohttp.TCPConnector(ssl=False)
+            async with aiohttp.ClientSession(connector=connector) as session:
+                headers = {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                }
+                async with session.get(
+                    url,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=60),
+                    allow_redirects=True,
+                ) as response:
+                    if response.status != 200:
+                        return f"無法下載檔案：HTTP {response.status}"
+
+                    file_bytes = await response.read()
+                    # 20MB limit
+                    if len(file_bytes) > 20 * 1024 * 1024:
+                        return f"檔案太大（{len(file_bytes) / 1024 / 1024:.1f}MB），上限為 20MB"
+
+        except Exception as e:
+            logger.error(f"File download failed: {e}")
+            return f"無法下載檔案：{str(e)}"
+
+        logger.info(f"Downloaded file: {len(file_bytes)} bytes, type={file_type.value}")
+
+        # MIME type mapping
+        ext_to_mime = {
+            ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+            ".png": "image/png", ".gif": "image/gif", ".webp": "image/webp",
+            ".pdf": "application/pdf",
+            ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        }
+        mime_type = ext_to_mime.get(ext, "application/octet-stream")
+
+        # Process based on type
+        if file_type == FileType.IMAGE:
+            b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+            # Return as Claude content blocks for vision
+            return [
+                {
+                    "type": "text",
+                    "text": f"用戶分享了一張圖片（{url}），請分析圖片內容並用繁體中文描述：",
+                },
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime_type,
+                        "data": b64,
+                    },
+                },
+            ]
+
+        elif file_type == FileType.PDF:
+            b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+            return [
+                {
+                    "type": "text",
+                    "text": f"用戶分享了一個 PDF 檔案（{url}），請分析內容並用繁體中文提供摘要：",
+                },
+                {
+                    "type": "document",
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime_type,
+                        "data": b64,
+                    },
+                },
+            ]
+
+        elif file_type == FileType.DOCX:
+            try:
+                text = extract_text_from_docx(file_bytes)
+                return f"以下是 Word 文件（{url}）的內容：\n\n{text[:10000]}"
+            except Exception as e:
+                return f"無法解析 Word 文件：{str(e)}"
+
+        elif file_type == FileType.PPTX:
+            try:
+                text = extract_text_from_pptx(file_bytes)
+                return f"以下是 PowerPoint 文件（{url}）的內容：\n\n{text[:10000]}"
+            except Exception as e:
+                return f"無法解析 PowerPoint 文件：{str(e)}"
+
+        return f"不支援的檔案類型：{file_type.value}"
 
     async def _fetch_html(self, url: str) -> str:
         """Fetch raw HTML from a URL via HTTP GET.
@@ -464,12 +603,17 @@ class ClaudeAgentService:
 
     async def _handle_tool_use(
         self, tool_name: str, tool_input: dict
-    ) -> str:
-        """Handle tool execution."""
+    ) -> str | list[dict]:
+        """Handle tool execution.
+
+        Returns either a string or a list of content blocks (for images/PDFs).
+        """
         if tool_name == "web_search":
             return await self._execute_web_search(tool_input["query"])
         elif tool_name == "summarize_url":
             return await self._execute_summarize_url(tool_input["url"])
+        elif tool_name == "analyze_file_url":
+            return await self._execute_analyze_file_url(tool_input["url"])
         else:
             return f"未知工具: {tool_name}"
 
