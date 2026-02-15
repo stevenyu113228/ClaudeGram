@@ -10,7 +10,7 @@
 - **對話上下文追蹤**: 透過 Telegram reply chain 維持對話脈絡
 - **檔案分析**: 上傳圖片、PDF、Word、PowerPoint 進行內容分析和摘要
 - **網頁搜尋**: 可搜尋網路獲取最新資訊
-- **網址摘要**: 自動摘要分享的網頁內容（繁體中文），支援兩階段智慧抓取
+- **網址摘要**: 自動摘要分享的網頁內容（繁體中文），4 層內容提取 pipeline + Playwright fallback
 - **用戶管理**: 只允許特定用戶或群組使用
 - **管理介面**: Web-based 管理面板，可管理用戶、群組和查看日誌
 
@@ -39,44 +39,42 @@
                                              └─────────────────────────────┘
 ```
 
-### 網址摘要兩階段架構
+### 網址摘要：4 層內容提取 Pipeline
 
-為了優化效能，網址摘要採用智慧兩階段策略：
+使用純 heuristics 的 4 層 data source discovery pipeline，無需 LLM 判斷即可決定內容是否足夠，大幅減少 Playwright 調用：
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                    URL Summarization Flow                        │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                    ┌─────────▼─────────┐
-                    │   Check Cache     │
-                    └─────────┬─────────┘
-                              │ miss
-                    ┌─────────▼─────────┐
-                    │  Stage 1: HTTP    │  ← aiohttp (快速)
-                    │  Simple Fetch     │
-                    └─────────┬─────────┘
-                              │
-                    ┌─────────▼─────────┐
-                    │  Stage 2: LLM     │  ← Claude Haiku (輕量)
-                    │  SPA Detection    │
-                    └─────────┬─────────┘
-                              │
-              ┌───────────────┴───────────────┐
-              │                               │
-     ┌────────▼────────┐            ┌────────▼────────┐
-     │    COMPLETE     │            │      SPA        │
-     │  直接摘要返回    │            │ 調用 Playwright │
-     └─────────────────┘            └─────────────────┘
-           ~5-10s                        ~60-90s
+HTTP GET (aiohttp) → 原始 HTML
+         │
+    Layer 1: 語意 HTML 提取（BeautifulSoup）
+         │   - <article>, <main>, [role="main"] 等語意標籤
+         │   - 移除 nav/footer/header/ads 等雜訊
+         │   - 提取 metadata: og:tags, description, author
+         │
+    Layer 2: 嵌入式資料提取
+         │   - __NEXT_DATA__ (Next.js SSR JSON)
+         │   - __NUXT__ / __NUXT_DATA__ (Nuxt.js)
+         │   - JSON-LD (application/ld+json)
+         │
+    Layer 3: 內容品質評分（純 heuristics，無 LLM）
+         │   - 字數 / 段落結構 / 資料源信心 / Metadata 完整度
+         │   - 負面訊號扣分 (loading..., template placeholders)
+         │   → sufficient (≥40) / insufficient (15-39) / unprocessable (<15)
+         │
+    Layer 4: 決策路由
+         ├─ sufficient → 直接送 Claude 摘要（~5s）
+         ├─ insufficient + 可靠來源 → 直接摘要
+         ├─ insufficient + 不可靠來源 → Playwright fallback
+         └─ unprocessable → Playwright fallback 或明確告知用戶
 ```
 
-| 階段 | 說明 | 耗時 |
-|------|------|------|
-| Stage 1 | 簡單 HTTP 抓取，適用大多數靜態網頁 | 2-3s |
-| Stage 2 | 使用 Claude Haiku 判斷是否為 SPA | 1-2s |
-| 直接摘要 | 內容完整時直接用 Claude 摘要 | 5-10s |
-| Playwright | 需要 JavaScript 渲染時使用瀏覽器 | 60-90s |
+| 場景 | 處理方式 | 預計耗時 |
+|------|----------|----------|
+| 有 `<article>` 的靜態網頁 | 直接摘要 | ~5s |
+| Next.js / Nuxt.js SSR 網站 | 從 `__NEXT_DATA__` 提取後摘要 | ~5s |
+| 有 JSON-LD 的新聞網站 | 從 structured data 提取後摘要 | ~5s |
+| 真正的 SPA（無 SSR） | Playwright fallback | ~60-90s |
+| Cloudflare 保護的網站 | Playwright fallback（HTTP 被擋） | ~60-90s |
 
 ## 技術棧
 
@@ -104,7 +102,8 @@ claudegram/
 │   │   ├── handler.py             # Lambda 入口點
 │   │   ├── auth.py                # 用戶認證
 │   │   ├── conversation.py        # 對話管理
-│   │   ├── claude_agent.py        # Claude SDK 整合（含兩階段摘要）
+│   │   ├── claude_agent.py        # Claude SDK 整合（含內容提取 pipeline）
+│   │   ├── content_extractor.py   # 4 層 HTML 內容提取 pipeline
 │   │   └── file_handler.py        # 檔案處理（下載、擷取文字）
 │   ├── summarizer_handler/        # Playwright 摘要 Lambda (Docker)
 │   │   ├── Dockerfile             # Lambda Container 定義

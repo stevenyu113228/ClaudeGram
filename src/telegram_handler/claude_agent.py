@@ -2,6 +2,7 @@
 import json
 import logging
 import os
+from datetime import datetime, timezone, timedelta
 from typing import Any
 
 import aiohttp
@@ -9,6 +10,7 @@ import boto3
 from anthropic import Anthropic
 
 from common.database import S3SQLiteManager, URLSummaryRepository
+from telegram_handler.content_extractor import extract_content_from_html
 
 # Configure logging for this module
 logger = logging.getLogger(__name__)
@@ -18,8 +20,13 @@ if not logger.handlers:
     handler.setFormatter(logging.Formatter('%(levelname)s - %(name)s - %(message)s'))
     logger.addHandler(handler)
 
-# System prompt for the bot
-SYSTEM_PROMPT = """你是一個友善且有幫助的 Telegram 聊天機器人助手。
+def _build_system_prompt() -> str:
+    """Build system prompt with current date/time (Asia/Taipei)."""
+    tz_tw = timezone(timedelta(hours=8))
+    now = datetime.now(tz_tw).strftime("%Y-%m-%d %H:%M (%A)")
+    return f"""你是一個友善且有幫助的 Telegram 聊天機器人助手。
+
+現在時間：{now}（台灣時間）
 
 你的主要功能：
 1. 回答用戶的問題和進行對話
@@ -188,99 +195,43 @@ class ClaudeAgentService:
             logger.error(f"Web search failed: {e}")
             return f"搜尋時發生錯誤: {str(e)}"
 
-    async def _fetch_content(self, url: str) -> tuple[str, str]:
-        """
-        Fetch web page content via simple HTTP request.
+    async def _fetch_html(self, url: str) -> str:
+        """Fetch raw HTML from a URL via HTTP GET.
 
         Returns:
-            Tuple of (content, title)
+            Raw HTML string
         """
-        import re
-
-        async with aiohttp.ClientSession() as session:
-            headers = {"User-Agent": "Mozilla/5.0 (compatible; TelegramBot/1.0)"}
+        connector = aiohttp.TCPConnector(ssl=False)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            headers = {
+                "User-Agent": (
+                    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/131.0.0.0 Safari/537.36"
+                ),
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7",
+                "Accept-Encoding": "gzip, deflate",
+            }
             async with session.get(
                 url,
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=15),
+                allow_redirects=True,
             ) as response:
                 if response.status != 200:
                     raise Exception(f"HTTP {response.status}")
-                html = await response.text()
-
-        # Extract text content
-        html_clean = re.sub(r"<script[^>]*>.*?</script>", "", html, flags=re.DOTALL)
-        html_clean = re.sub(r"<style[^>]*>.*?</style>", "", html_clean, flags=re.DOTALL)
-        text = re.sub(r"<[^>]+>", " ", html_clean)
-        text = re.sub(r"\s+", " ", text).strip()
-
-        # Extract title
-        title_match = re.search(r"<title[^>]*>([^<]+)</title>", html, re.IGNORECASE)
-        title = title_match.group(1).strip() if title_match else "未知標題"
-
-        return text, title
-
-    async def _detect_spa(self, content: str, title: str) -> bool:
-        """
-        Use LLM to detect if content appears to need JavaScript rendering.
-
-        Returns:
-            True if SPA detected (needs Playwright), False if content is complete
-        """
-        # Quick heuristics first
-        if len(content) < 500:
-            logger.info("SPA detection: content too short, assuming SPA")
-            return True  # Too little content, likely SPA
-
-        # Check for common SPA indicators
-        spa_indicators = [
-            "loading...",
-            "javascript required",
-            "enable javascript",
-            "please wait",
-            "[object object]",
-            "react-root",
-            "ng-app",
-            "__next",
-        ]
-        content_lower = content.lower()
-        if any(indicator in content_lower for indicator in spa_indicators):
-            logger.info("SPA detection: found SPA indicator keyword")
-            return True
-
-        # Use LLM for ambiguous cases
-        detection_prompt = f"""Analyze this web page content and determine if JavaScript rendering is needed.
-
-Title: {title}
-Content (first 2000 chars):
-{content[:2000]}
-
-Signs that JavaScript rendering IS needed:
-- Very little meaningful text
-- "Loading", "Please wait" messages
-- Template placeholders like {{{{variable}}}}
-- Empty sections that should have content
-
-Signs that content IS complete:
-- Substantial article text
-- Multiple paragraphs of readable content
-- Clear structure with headings
-
-Reply with ONLY one word: "COMPLETE" or "SPA"
-"""
-
-        response = self.client.messages.create(
-            model="claude-4.5-haiku",  # Use fast model for SPA detection
-            max_tokens=10,
-            messages=[{"role": "user", "content": detection_prompt}],
-        )
-
-        result = response.content[0].text.strip().upper()
-        logger.info(f"SPA detection result (haiku): {result}")
-        return result == "SPA"
+                return await response.text()
 
     async def _execute_summarize_url(self, url: str) -> str:
-        """Execute URL summarization with two-stage strategy."""
+        """Execute URL summarization with content extraction pipeline.
+
+        Uses a 4-layer data source discovery pipeline:
+        1. Semantic HTML extraction
+        2. Embedded data extraction (Next.js, Nuxt, JSON-LD)
+        3. Quality scoring (pure heuristics, no LLM)
+        4. Route based on quality decision
+        """
         logger.info(f"Summarizing URL: {url}")
 
         # Check if we have a cached summary
@@ -290,34 +241,77 @@ Reply with ONLY one word: "COMPLETE" or "SPA"
             return existing["summary_zh_tw"]
 
         try:
-            # Stage 1: Simple HTTP fetch (fast)
-            logger.info("Stage 1: Simple HTTP fetch")
-            content, title = await self._fetch_content(url)
+            # Fetch raw HTML
+            html = await self._fetch_html(url)
+            logger.info(f"Fetched HTML: {len(html)} chars")
 
-            # Stage 2: SPA detection
-            logger.info("Stage 2: SPA detection")
-            needs_playwright = await self._detect_spa(content, title)
+            # Run content extraction pipeline
+            extracted = extract_content_from_html(html)
+            logger.info(
+                f"Extraction result: score={extracted.quality_score}, "
+                f"decision={extracted.decision}, sources={extracted.sources}"
+            )
 
-            if needs_playwright:
-                # Use Playwright Lambda for JavaScript rendering
-                logger.info("SPA detected, using Playwright Lambda")
-                # Notify user that we're using the slower method
-                await self._send_telegram_message(
-                    "🔄 偵測到此網頁需要 JavaScript 渲染，正在使用瀏覽器模式載入，請稍候..."
+            if extracted.decision == "sufficient":
+                # Content is good enough, summarize directly
+                logger.info("Content sufficient, summarizing directly")
+                return await self._summarize_content(
+                    url, extracted.title or "未知標題", extracted.text
                 )
-                return await self._playwright_summarize(url)
-            else:
-                # Content is complete, summarize directly
-                logger.info("Content complete, summarizing directly")
-                return await self._summarize_content(url, title, content)
+
+            elif extracted.decision == "insufficient":
+                # Check if content came from a reliable source (semantic tags, embedded data)
+                # vs. just random body text that might be SPA boilerplate
+                reliable_sources = {
+                    "next_data", "nuxt_data", "json_ld",
+                    "semantic:article", "semantic:main", "semantic:role-main",
+                    "semantic:id-match", "semantic:class-match",
+                }
+                has_reliable_source = any(s in reliable_sources for s in extracted.sources)
+
+                if extracted.text and has_reliable_source:
+                    # Content from semantic/structured source — real content, just short
+                    logger.info("Content insufficient but from reliable source, summarizing directly")
+                    return await self._summarize_content(
+                        url, extracted.title or "未知標題", extracted.text
+                    )
+                elif self.config.summarizer_function_name:
+                    # Unreliable source (fallback:body) — likely SPA boilerplate, try Playwright
+                    logger.info("Content insufficient from unreliable source, trying Playwright")
+                    await self._send_telegram_message(
+                        "🔄 網頁內容不完整，正在使用瀏覽器模式載入，請稍候..."
+                    )
+                    return await self._playwright_summarize(url)
+                elif extracted.text:
+                    # No Playwright available, use whatever we have
+                    logger.info("Content insufficient, no Playwright, using best available")
+                    return await self._summarize_content(
+                        url, extracted.title or "未知標題", extracted.text
+                    )
+                else:
+                    return "無法從此網頁提取足夠的內容進行摘要。網頁可能需要 JavaScript 渲染。"
+
+            else:  # unprocessable
+                # Last resort: try Playwright
+                if self.config.summarizer_function_name:
+                    logger.info("Content unprocessable, last resort Playwright")
+                    await self._send_telegram_message(
+                        "🔄 網頁需要特殊處理，正在使用瀏覽器模式載入，請稍候..."
+                    )
+                    return await self._playwright_summarize(url)
+                else:
+                    reason = extracted.decision_reason or "無法提取內容"
+                    return f"無法摘要此網頁。原因：{reason}"
 
         except Exception as e:
-            logger.error(f"Two-stage summarize failed: {e}")
-            # Fallback to Playwright if simple fetch fails
-            await self._send_telegram_message(
-                "🔄 網頁需要特殊處理，正在使用瀏覽器模式載入，請稍候..."
-            )
-            return await self._playwright_summarize(url)
+            logger.error(f"Content extraction pipeline failed: {e}")
+            # Fallback to Playwright if available
+            if self.config.summarizer_function_name:
+                await self._send_telegram_message(
+                    "🔄 網頁需要特殊處理，正在使用瀏覽器模式載入，請稍候..."
+                )
+                return await self._playwright_summarize(url)
+            return f"無法摘要此網頁: {str(e)}"
 
     async def _simple_summarize(self, url: str) -> str:
         """Simple URL summarization without Playwright."""
@@ -510,7 +504,7 @@ Reply with ONLY one word: "COMPLETE" or "SPA"
         response = self.client.messages.create(
             model=self.config.anthropic_model,
             max_tokens=2000,
-            system=SYSTEM_PROMPT,
+            system=_build_system_prompt(),
             tools=self._get_tools(),
             messages=messages,
         )
@@ -545,7 +539,7 @@ Reply with ONLY one word: "COMPLETE" or "SPA"
             response = self.client.messages.create(
                 model=self.config.anthropic_model,
                 max_tokens=2000,
-                system=SYSTEM_PROMPT,
+                system=_build_system_prompt(),
                 tools=self._get_tools(),
                 messages=messages,
             )
