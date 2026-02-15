@@ -302,21 +302,55 @@ class ClaudeAgentService:
             ]
 
         elif file_type == FileType.PDF:
-            b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
-            return [
-                {
-                    "type": "text",
-                    "text": f"用戶分享了一個 PDF 檔案（{url}），請分析內容並用繁體中文提供摘要：",
-                },
-                {
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": mime_type,
-                        "data": b64,
+            # Check page count — Claude API has a 100 page limit
+            import io
+            try:
+                import pypdf
+                reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+                page_count = len(reader.pages)
+                logger.info(f"PDF has {page_count} pages")
+            except Exception:
+                # If we can't read page count, estimate from file size
+                # Average ~50KB per page for text-heavy PDFs
+                page_count = len(file_bytes) // (50 * 1024) or 1
+                logger.info(f"Could not read PDF pages, estimated {page_count}")
+
+            if page_count <= 100:
+                b64 = base64.standard_b64encode(file_bytes).decode("utf-8")
+                return [
+                    {
+                        "type": "text",
+                        "text": f"用戶分享了一個 PDF 檔案（{url}，共 {page_count} 頁），請分析內容並用繁體中文提供摘要：",
                     },
-                },
-            ]
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": mime_type,
+                            "data": b64,
+                        },
+                    },
+                ]
+            else:
+                # Too many pages — extract text instead
+                logger.info(f"PDF too large ({page_count} pages), extracting text")
+                try:
+                    reader = pypdf.PdfReader(io.BytesIO(file_bytes))
+                    text_parts = []
+                    for i, page in enumerate(reader.pages[:100]):  # First 100 pages
+                        page_text = page.extract_text()
+                        if page_text:
+                            text_parts.append(f"--- 第 {i+1} 頁 ---\n{page_text}")
+                    text = "\n\n".join(text_parts)
+                    if text:
+                        return (
+                            f"PDF 檔案（{url}）共 {page_count} 頁，超過 100 頁限制，"
+                            f"以下為前 100 頁的文字內容：\n\n{text[:15000]}"
+                        )
+                    else:
+                        return f"PDF 檔案（{url}）共 {page_count} 頁，超過限制且無法提取文字內容（可能是掃描檔）。"
+                except Exception as e:
+                    return f"PDF 檔案共 {page_count} 頁，超過 100 頁限制，且文字提取失敗：{str(e)}"
 
         elif file_type == FileType.DOCX:
             try:
